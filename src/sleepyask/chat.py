@@ -3,6 +3,9 @@ import time
 import queue
 import json
 import asyncio
+import aiohttp
+import aiofiles
+
 
 from openai_async import openai_async
 
@@ -37,80 +40,77 @@ class Sleepyask:
         self.retry_time = retry_time
         self.system_text = system_text
 
-    def get_asked_ids(self):
+    async def get_asked_ids(self, out_path):
         asked_ids = set()
 
-        # Checks for questions that have already been asked before
-        if os.path.isfile(self.out_path):
-            outfile = open(self.out_path)
-            json_list = list(outfile)
+        if os.path.isfile(out_path):
+            async with aiofiles.open(out_path, "r") as infile:
+                async for row in infile:
+                    try:
+                        row = json.loads(row)
+                        if "question_id" in row:
+                            asked_ids.add(str(row["question_id"]))
+                    except:
+                        pass
 
-            for row in json_list:
-                try:
-                    row = json.loads(row)
-                
-                    if "question_id" in row: 
-                        asked_ids.add(str(row["question_id"]))
-                        self.succeed += 1
-                except: pass
-            outfile.close()
         return asked_ids
 
-    def start(self, question_list, out_path):
-        """
-        `question_list` list of questions to ask ChatGPT
-        """
+    async def start(self, question_list, out_path):
         self.out_path = out_path
-        
-        asyncio.run(self.__start(question_list))
-
-    async def __start(self, question_list):
         self.succeed = 0
         self.file_lock = asyncio.Lock()
-        self.question_queue = queue.Queue()
+        self.question_queue = asyncio.Queue()
 
-        asked_ids = self.get_asked_ids()
+        asked_ids = await self.get_asked_ids(out_path)
 
-        for question in question_list: 
-            if str(question["id"]) in asked_ids: continue
-            self.question_queue.put(question)
+        for question in question_list:
+            if str(question["id"]) not in asked_ids:
+                await self.question_queue.put(question)
 
-        while self.succeed < len(question_list):
-            tasks = []
-            for _ in range(self.rate_limit):
-                try: tasks.append(self.async_ask(self.question_queue.get(False)))
-                except: pass
+        await asyncio.gather(*[self.async_ask() for _ in range(self.rate_limit)])
 
-            await asyncio.gather(*tasks)
-
-            if self.succeed < len(question_list): time.sleep(self.retry_time)
 
     async def log(self, response):
-        await self.file_lock.acquire()
+        async with self.file_lock:
+            async with aiofiles.open(self.out_path, "a") as outfile:
+                await outfile.write(json.dumps(response))
+                await outfile.write("\n")
 
-        with open(self.out_path, "a") as outfile:
-            outfile.write(json.dumps(response))
-            outfile.write("\n")
+            self.succeed += 1
 
-        self.succeed += 1
-        self.file_lock.release()
+    async def async_ask(self, question_list):
+        while self.succeed < len(question_list):
+            question = await self.question_queue.get()
+            question_index = question["id"]
+            question_text = question["text"]
 
-    async def async_ask(self, question):
-        question_index = question["id"]
-        question_text = question["text"]
+            try:
+                if self.verbose:
+                    print(f"[sleepyask] INFO | ID {question_index} | ASKING: {question_text}")
 
-        try:
-            if self.verbose: print(f"[sleepyask] INFO | ID {question_index} | ASKING: {question_text}")
+                payload = {
+                    "messages": [
+                        {"role": "system", "content": self.system_text},
+                        {"role": "user", "content": question_text}
+                    ],
+                    **self.configs
+                }
+                response = await openai_async.chat_complete(payload=payload, api_key=self.api_key, timeout=self.timeout)
 
-            payload = {"messages": [{"role": "system", "content": self.system_text}, {"role": "user", "content": question_text}], **self.configs}
-            response = await openai_async.chat_complete(payload=payload, api_key=self.api_key, timeout=self.timeout)
+                if self.verbose:
+                    print(f"[sleepyask] INFO | ID {question_index} | RECEIVED: {response.text}")
+
+                if response.status_code != 200:
+                    if self.verbose:
+                        print(f"[sleepyask] INFO | ID {question_index} | {response.status_code}")
+                    raise ValueError("Should be 200")
+
+                await self.log({"question_id": question_index, **json.loads(response.text), "question": question_text, **self.configs})
+            except:
+                if self.verbose:
+                    print(f"[sleepyask] INFO | ID {question_index} | ERROR")
+                await self.question_queue.put(question)
+
+            await asyncio.sleep(self.retry_time)
             
-            if self.verbose: print(f"[sleepyask] INFO | ID {question_index} | RECEIVED: {response.text}")
-            if response.status_code != 200: 
-                if self.verbose: print(f"[sleepyask] INFO | ID {question_index} | {response.status_code}")
-                raise ValueError("Should be 200")
-
-            await self.log({"question_id": question_index,  **json.loads(response.text), "question": question_text, **self.configs})
-        except: 
-            if self.verbose: print(f"[sleepyask] INFO | ID {question_index} | ERROR")
-            self.question_queue.put(question)
+        await asyncio.sleep(0)
